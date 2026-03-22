@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import logging
 import time
 
@@ -6,6 +7,7 @@ import websockets.exceptions
 
 from app.api.listener_server import run_server
 from app.clients import backend_client
+from app.clients.dexscreener_client import get_token_info
 from app.clients.helius_http_client import fetch_enhanced_transaction
 from app.clients.helius_ws_client import HeliusWsClient, wait_with_reconnect_log
 from app.core.config import settings
@@ -150,6 +152,13 @@ class WalletListenerWorker:
         event = wallet_event_parser.parse(enhanced, watched)
         if event is None:
             return
+
+        token_info = await get_token_info(event.token_address)
+        event = dataclasses.replace(
+            event,
+            token_symbol=event.token_symbol or token_info.symbol,
+            market_cap=token_info.market_cap,
+        )
 
         wallet_map = self._active_user_service.get_wallet_to_users_map()
         signals = signal_engine.evaluate(event, wallet_map)

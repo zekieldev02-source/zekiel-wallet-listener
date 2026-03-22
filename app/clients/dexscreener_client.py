@@ -33,16 +33,18 @@ async def get_token_info(token_address: str) -> TokenInfo:
             resp.raise_for_status()
             pairs: list[dict] = resp.json().get("pairs") or []
     except Exception as exc:
-        _logger.debug("DexScreener request failed for %s: %s", token_address[:8], exc)
+        _logger.warning("DexScreener request failed for %s: %s", token_address[:8], exc)
         return TokenInfo(symbol=None, market_cap=None)
 
+    token_lower = token_address.lower()
     solana_pairs = [
         p for p in pairs
         if p.get("chainId") == "solana"
-        and (p.get("baseToken") or {}).get("address") == token_address
+        and (p.get("baseToken") or {}).get("address", "").lower() == token_lower
     ]
 
     if not solana_pairs:
+        _logger.warning("DexScreener: no Solana pair found for %s", token_address[:8])
         return TokenInfo(symbol=None, market_cap=None)
 
     best = max(

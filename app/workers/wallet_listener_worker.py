@@ -8,6 +8,7 @@ import websockets.exceptions
 from app.api.listener_server import run_server
 from app.clients import backend_client
 from app.clients.dexscreener_client import get_token_info
+from app.clients.pump_fun_client import get_token_symbol
 from app.clients.helius_http_client import fetch_enhanced_transaction
 from app.clients.helius_ws_client import HeliusWsClient, wait_with_reconnect_log
 from app.core.config import settings
@@ -36,6 +37,7 @@ class WalletListenerWorker:
         self._active_user_service = ActiveUserService()
         self._subscription_service = SubscriptionService()
         self._helius_client = HeliusWsClient()
+        self._seen_signatures: dict[str, float] = {}
 
     async def run(self) -> None:
         _logger.info("WalletListenerWorker started.")
@@ -77,6 +79,9 @@ class WalletListenerWorker:
                 if self._helius_client.is_connected():
                     desired = self._active_user_service.get_wallet_to_user_ids_map()
                     await self._subscription_service.sync(desired, self._helius_client)
+                    await self._helius_client.resubscribe(
+                        self._subscription_service.get_subscribed_wallets()
+                    )
             except Exception:
                 _logger.exception("Error in refresh_loop (continued).")
 
@@ -143,6 +148,14 @@ class WalletListenerWorker:
         if not signature:
             return
 
+        # Deduplicate: same signature can arrive twice when resubscribing
+        now = received_at
+        self._seen_signatures = {s: t for s, t in self._seen_signatures.items() if now - t < 10.0}
+        if signature in self._seen_signatures:
+            _logger.debug("[ON_MESSAGE] duplicate sig=%s — skipped.", signature[:16])
+            return
+        self._seen_signatures[signature] = now
+
         enhanced = await fetch_enhanced_transaction(signature)
         if enhanced is None:
             _logger.warning("[ON_MESSAGE] sig=%s — enrichment failed.", signature[:16])
@@ -153,10 +166,15 @@ class WalletListenerWorker:
         if event is None:
             return
 
-        token_info = await get_token_info(event.token_address)
+        token_info, fallback_symbol = await asyncio.gather(
+            get_token_info(event.token_address),
+            get_token_symbol(event.token_address),
+        )
+        symbol = event.token_symbol or token_info.symbol or fallback_symbol
+
         event = dataclasses.replace(
             event,
-            token_symbol=event.token_symbol or token_info.symbol,
+            token_symbol=symbol,
             market_cap=token_info.market_cap,
         )
 

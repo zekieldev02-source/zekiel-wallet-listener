@@ -14,6 +14,7 @@ _logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.dexscreener.com"
 _TIMEOUT = 5.0
+_client = httpx.AsyncClient(base_url=_BASE_URL, timeout=_TIMEOUT)
 
 
 @dataclass(frozen=True)
@@ -28,10 +29,9 @@ async def get_token_info(token_address: str) -> TokenInfo:
     Returns TokenInfo with None fields if the token is not found or the request fails.
     """
     try:
-        async with httpx.AsyncClient(base_url=_BASE_URL, timeout=_TIMEOUT) as client:
-            resp = await client.get(f"/latest/dex/tokens/{token_address}")
-            resp.raise_for_status()
-            pairs: list[dict] = resp.json().get("pairs") or []
+        resp = await _client.get(f"/latest/dex/tokens/{token_address}")
+        resp.raise_for_status()
+        pairs: list[dict] = resp.json().get("pairs") or []
     except Exception as exc:
         _logger.warning("DexScreener request failed for %s: %s", token_address[:8], exc)
         return TokenInfo(symbol=None, market_cap=None)

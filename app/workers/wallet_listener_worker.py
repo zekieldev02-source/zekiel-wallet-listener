@@ -9,6 +9,7 @@ from app.api.listener_server import run_server
 from app.clients import backend_client
 from app.clients.dexscreener_client import get_token_info
 from app.clients.pump_fun_client import get_token_symbol
+from app.clients.pump_fun_onchain_client import get_market_cap as get_pump_market_cap
 from app.clients.helius_http_client import fetch_enhanced_transaction
 from app.clients.helius_ws_client import HeliusWsClient, wait_with_reconnect_log
 from app.core.config import settings
@@ -139,8 +140,8 @@ class WalletListenerWorker:
     async def _on_message(self, raw: dict) -> None:
         """Critical path: enrich → parse → evaluate → send signal.
 
-        Helius WS sends raw Solana format (slot/signature/transaction).
-        Enriched via REST API to get type, feePayer, and tokenTransfers before parsing.
+        Helius WS sends raw Solana format. Enriched via REST API to get type,
+        feePayer, and tokenTransfers. Market cap via DexScreener with Pump.fun fallback.
         """
         received_at = time.monotonic()
 
@@ -166,16 +167,18 @@ class WalletListenerWorker:
         if event is None:
             return
 
-        token_info, fallback_symbol = await asyncio.gather(
+        token_info, fallback_symbol, pump_mc = await asyncio.gather(
             get_token_info(event.token_address),
             get_token_symbol(event.token_address),
+            get_pump_market_cap(event.token_address),
         )
         symbol = event.token_symbol or token_info.symbol or fallback_symbol
+        market_cap = token_info.market_cap if token_info.market_cap is not None else pump_mc
 
         event = dataclasses.replace(
             event,
             token_symbol=symbol,
-            market_cap=token_info.market_cap,
+            market_cap=market_cap,
         )
 
         wallet_map = self._active_user_service.get_wallet_to_users_map()

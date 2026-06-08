@@ -12,31 +12,32 @@ from app.core.config import settings
 
 _logger = logging.getLogger(__name__)
 
-type OnMessageCallback = Callable[[dict], Coroutine[Any, Any, None]]
+type OnMessageCallback = Callable[[str], Coroutine[Any, Any, None]]
 
 
 class HeliusWsClient:
-    """WebSocket client for Helius Enhanced Transactions (atlas endpoint).
+    """WebSocket client using logsSubscribe (available on Helius free plan).
 
-    Protocol: transactionSubscribe (Helius-specific, Geyser-backed).
-    Endpoint: wss://atlas-mainnet.helius-rpc.com/?api-key=...
+    Subscribes one subscription per wallet using {"mentions": [address]}.
+    Each logsNotification yields a transaction signature, which is then
+    enriched via the Helius Enhanced Transactions REST API.
 
-    To migrate to Helius LaserStream (gRPC), replace this class without
-    touching call sites — subscription_service and wallet_listener_worker
-    only use connect(), resubscribe(), and listen_forever().
+    Endpoint: wss://mainnet.helius-rpc.com/?api-key=...
     """
 
     def __init__(self) -> None:
         self._ws: websockets.WebSocketClientProtocol | None = None
-        self._subscription_id: int | None = None
         self._request_id: int = 0
+        # subscription_id → wallet_address
+        self._subscriptions: dict[int, str] = {}
+        # pending request_id → wallet_address (before confirmation)
+        self._pending: dict[int, str] = {}
 
     def _next_id(self) -> int:
         self._request_id += 1
         return self._request_id
 
     async def connect(self) -> None:
-        """Opens the WebSocket connection to Helius."""
         url = settings.helius_ws_endpoint
         _logger.info("Connecting to Helius WebSocket: %s", url.split("?")[0])
         self._ws = await websockets.connect(
@@ -45,71 +46,61 @@ class HeliusWsClient:
             ping_timeout=10,
             close_timeout=5,
         )
-        self._subscription_id = None
+        self._subscriptions.clear()
+        self._pending.clear()
         _logger.info("Helius WebSocket connected.")
 
     async def subscribe_wallets(self, addresses: set[str]) -> None:
-        """Subscribes to transactions for the given wallet addresses via transactionSubscribe."""
-        if not addresses:
+        """Subscribe to logs for each wallet address individually."""
+        if not addresses or self._ws is None:
             return
-        if self._ws is None:
-            raise RuntimeError("WebSocket not connected. Call connect() first.")
 
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "transactionSubscribe",
-            "params": [
-                {
-                    "vote": False,
-                    "failed": False,
-                    "accountInclude": list(addresses),
-                },
-                {
-                    "commitment": "confirmed",
-                    "encoding": "jsonParsed",
-                    "transactionDetails": "full",
-                    "showRewards": False,
-                    "maxSupportedTransactionVersion": 0,
-                },
-            ],
-        }
-        await self._ws.send(json.dumps(payload))
+        for address in addresses:
+            req_id = self._next_id()
+            self._pending[req_id] = address
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "logsSubscribe",
+                "params": [
+                    {"mentions": [address]},
+                    {"commitment": "confirmed"},
+                ],
+            }
+            await self._ws.send(json.dumps(payload))
+
         _logger.info("Helius subscription sent for %d wallet(s).", len(addresses))
 
     async def unsubscribe(self) -> None:
-        """Cancels the active subscription if one exists."""
-        if self._ws is None or self._subscription_id is None:
+        """Cancel all active subscriptions."""
+        if self._ws is None:
             return
 
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "transactionUnsubscribe",
-            "params": [self._subscription_id],
-        }
-        try:
-            await self._ws.send(json.dumps(payload))
-            _logger.debug("Unsubscribe sent (subscription_id=%s).", self._subscription_id)
-        except websockets.exceptions.WebSocketException:
-            pass
-        finally:
-            self._subscription_id = None
+        for sub_id in list(self._subscriptions.keys()):
+            payload = {
+                "jsonrpc": "2.0",
+                "id": self._next_id(),
+                "method": "logsUnsubscribe",
+                "params": [sub_id],
+            }
+            try:
+                await self._ws.send(json.dumps(payload))
+            except websockets.exceptions.WebSocketException:
+                pass
+
+        self._subscriptions.clear()
+        self._pending.clear()
 
     async def resubscribe(self, addresses: set[str]) -> None:
-        """Cancels the active subscription and re-subscribes with the new wallet list.
-
-        If addresses is empty, only unsubscribes.
-        """
         await self.unsubscribe()
         if addresses:
             await self.subscribe_wallets(addresses)
 
     async def listen_forever(self, on_message: OnMessageCallback) -> None:
-        """Listens for Helius messages and dispatches transactionNotification events to the callback.
+        """Listen for logsNotification messages and dispatch transaction signatures.
 
-        Subscription confirmations update _subscription_id; unknown messages are silently ignored.
-        Raises websockets.exceptions.ConnectionClosed on disconnect so the worker can reconnect.
+        The callback receives the raw transaction signature (str).
+        The caller is responsible for enriching it via the Helius REST API.
         """
         if self._ws is None:
             raise RuntimeError("WebSocket not connected.")
@@ -121,16 +112,30 @@ class HeliusWsClient:
                 _logger.warning("Non-JSON message from Helius ignored.")
                 continue
 
-            if "result" in msg and isinstance(msg["result"], int):
-                self._subscription_id = msg["result"]
-                _logger.info("Helius subscription confirmed (id=%s).", self._subscription_id)
+            # Subscription confirmed: map request_id → subscription_id
+            if "result" in msg and isinstance(msg.get("result"), int):
+                req_id = msg.get("id")
+                sub_id = msg["result"]
+                if req_id in self._pending:
+                    wallet = self._pending.pop(req_id)
+                    self._subscriptions[sub_id] = wallet
+                    _logger.info(
+                        "Helius logsSubscribe confirmed: wallet=%s sub_id=%d",
+                        wallet[:8], sub_id,
+                    )
                 continue
 
-            if msg.get("method") == "transactionNotification":
-                result = msg.get("params", {}).get("result")
-                if result:
+            if msg.get("method") == "logsNotification":
+                value = msg.get("params", {}).get("result", {}).get("value", {})
+                signature = value.get("signature")
+                err = value.get("err")
+
+                if err:
+                    continue  # Skip failed transactions
+
+                if signature:
                     try:
-                        await on_message(result)
+                        await on_message(signature)
                     except Exception:
                         _logger.exception("Error in on_message callback.")
                 continue
@@ -142,7 +147,6 @@ class HeliusWsClient:
         return self._ws is not None and self._ws.state == State.OPEN
 
     async def close(self) -> None:
-        """Closes the WebSocket connection cleanly."""
         if self._ws is not None:
             await self._ws.close()
             self._ws = None

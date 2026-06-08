@@ -80,9 +80,6 @@ class WalletListenerWorker:
                 if self._helius_client.is_connected():
                     desired = self._active_user_service.get_wallet_to_user_ids_map()
                     await self._subscription_service.sync(desired, self._helius_client)
-                    await self._helius_client.resubscribe(
-                        self._subscription_service.get_subscribed_wallets()
-                    )
             except Exception:
                 _logger.exception("Error in refresh_loop (continued).")
 
@@ -137,19 +134,19 @@ class WalletListenerWorker:
             telegram_id, wallet_address[:4], wallet_address[-4:], latency_ms,
         )
 
-    async def _on_message(self, raw: dict) -> None:
+    async def _on_message(self, signature: str) -> None:
         """Critical path: enrich → parse → evaluate → send signal.
 
-        Helius WS sends raw Solana format. Enriched via REST API to get type,
-        feePayer, and tokenTransfers. Market cap via DexScreener with Pump.fun fallback.
+        Receives a transaction signature from logsSubscribe.
+        Enriched via Helius Enhanced Transactions REST API.
+        Market cap via DexScreener with Pump.fun fallback.
         """
         received_at = time.monotonic()
 
-        signature = raw.get("signature", "")
         if not signature:
             return
 
-        # Deduplicate: same signature can arrive twice when resubscribing
+        # Deduplicate: same signature arrives once per subscribed wallet that's mentioned
         now = received_at
         self._seen_signatures = {s: t for s, t in self._seen_signatures.items() if now - t < 10.0}
         if signature in self._seen_signatures:
@@ -164,33 +161,41 @@ class WalletListenerWorker:
 
         watched = self._active_user_service.get_watched_wallets()
         event = wallet_event_parser.parse(enhanced, watched)
-        if event is None:
+        sell_event = wallet_event_parser.parse_sell(enhanced, watched)
+
+        if event is None and sell_event is None:
             return
 
-        token_info, fallback_symbol, pump_mc = await asyncio.gather(
-            get_token_info(event.token_address),
-            get_token_symbol(event.token_address),
-            get_pump_market_cap(event.token_address),
-        )
-        symbol = event.token_symbol or token_info.symbol or fallback_symbol
-        market_cap = token_info.market_cap if token_info.market_cap is not None else pump_mc
-
-        event = dataclasses.replace(
-            event,
-            token_symbol=symbol,
-            market_cap=market_cap,
-        )
-
         wallet_map = self._active_user_service.get_wallet_to_users_map()
-        signals = signal_engine.evaluate(event, wallet_map)
+        buy_signals: list = []
+        sell_signals: list = []
 
-        for signal in signals:
-            await backend_client.post_buy_signal(signal)
+        if event is not None:
+            token_info, fallback_symbol, pump_mc = await asyncio.gather(
+                get_token_info(event.token_address),
+                get_token_symbol(event.token_address),
+                get_pump_market_cap(event.token_address),
+            )
+            symbol = event.token_symbol or token_info.symbol or fallback_symbol
+            market_cap = token_info.market_cap if token_info.market_cap is not None else pump_mc
+            event = dataclasses.replace(event, token_symbol=symbol, market_cap=market_cap)
 
-        if signals:
+            buy_signals = signal_engine.evaluate(event, wallet_map)
+            for signal in buy_signals:
+                await backend_client.post_buy_signal(signal)
+
+        if sell_event is not None:
+            sell_signals = signal_engine.evaluate_sell(sell_event, wallet_map)
+            for signal in sell_signals:
+                await backend_client.post_sell_signal(signal)
+
+        total_signals = len(buy_signals) + len(sell_signals)
+        if total_signals:
             latency_ms = (time.monotonic() - received_at) * 1000
+            token_addr = (event or sell_event).token_address  # type: ignore[union-attr]
+            wallet_addr = (event or sell_event).wallet_address  # type: ignore[union-attr]
             _logger.info(
-                "[EVENT] wallet=%s...%s token=%s signals=%d latency=%.1fms",
-                event.wallet_address[:4], event.wallet_address[-4:],
-                event.token_address[:8], len(signals), latency_ms,
+                "[EVENT] wallet=%s...%s token=%s buy=%d sell=%d latency=%.1fms",
+                wallet_addr[:4], wallet_addr[-4:],
+                token_addr[:8], len(buy_signals), len(sell_signals), latency_ms,
             )

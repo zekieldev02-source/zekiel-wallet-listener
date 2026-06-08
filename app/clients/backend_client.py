@@ -5,6 +5,7 @@ import httpx
 from app.core.config import settings
 from app.schemas.active_user import ActiveUser
 from app.schemas.internal_buy_signal import InternalBuySignal
+from app.schemas.internal_sell_signal import InternalSellSignal
 
 _logger = logging.getLogger(__name__)
 
@@ -81,4 +82,36 @@ async def post_buy_signal(signal: InternalBuySignal) -> bool:
             signal.user_id,
             exc,
         )
+        return False
+
+
+async def post_sell_signal(signal: InternalSellSignal) -> bool:
+    """Sends a sell signal to the backend. Returns True on 202."""
+    url = f"{settings.BACKEND_URL}/internal/signals/sell"
+    try:
+        async with httpx.AsyncClient(timeout=settings.HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.post(url, headers=_HEADERS, json=signal.to_payload())
+
+        if resp.status_code == 202:
+            return True
+
+        if resp.status_code == 404:
+            _logger.debug(
+                "Sell signal ignored (no open position): user=%s token=%s",
+                signal.user_id, signal.token_address[:8],
+            )
+            return False
+
+        if resp.status_code == 401:
+            _logger.warning("Backend post_sell_signal: 401 Unauthorized.")
+            return False
+
+        _logger.warning(
+            "Backend post_sell_signal: unexpected %s for user=%s token=%s",
+            resp.status_code, signal.user_id, signal.token_address[:8],
+        )
+        return False
+
+    except httpx.RequestError as exc:
+        _logger.warning("Backend post_sell_signal request error: %s", exc)
         return False

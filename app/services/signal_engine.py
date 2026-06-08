@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from app.core.constants import SIGNAL_SOURCE
 from app.schemas.active_user import ActiveUser
 from app.schemas.internal_buy_signal import InternalBuySignal
+from app.schemas.internal_sell_signal import InternalSellSignal
 from app.schemas.wallet_event import WalletEvent
+from app.schemas.wallet_sell_event import WalletSellEvent
 
 _logger = logging.getLogger(__name__)
 
@@ -55,6 +57,34 @@ def evaluate(
             user.user_id,
             event.token_address[:8],
             event.entry_price,
+        )
+
+    return signals
+
+
+def evaluate_sell(
+    event: WalletSellEvent,
+    wallet_to_users: dict[str, list[ActiveUser]],
+) -> list[InternalSellSignal]:
+    """Returns one InternalSellSignal per active user following the event's wallet."""
+    users = wallet_to_users.get(event.wallet_address, [])
+    if not users:
+        return []
+
+    timestamp = event.timestamp or datetime.now(tz=timezone.utc)
+    signals = []
+
+    for user in users:
+        signals.append(InternalSellSignal(
+            user_id=user.user_id,
+            wallet_address=event.wallet_address,
+            token_address=event.token_address,
+            source=SIGNAL_SOURCE,
+            timestamp=timestamp,
+        ))
+        _logger.debug(
+            "Sell signal generated: user=%s token=%s",
+            user.user_id, event.token_address[:8],
         )
 
     return signals

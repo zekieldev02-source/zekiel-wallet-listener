@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "http://127.0.0.1:8000"
     INTERNAL_API_KEY: str = "changeme-internal-key"
 
-    HELIUS_WS_URL: str = "wss://atlas-mainnet.helius-rpc.com"
+    HELIUS_WS_URL: str = "wss://mainnet.helius-rpc.com"
     HELIUS_API_KEY: str = ""
 
     LISTENER_HTTP_PORT: int = 8001
